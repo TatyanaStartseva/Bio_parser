@@ -20,7 +20,7 @@ HOST = os.getenv("HOST")
 DATABASE = os.getenv("DATABASE")
 USER = os.getenv("USERNAME_DB")
 PASSWORD = os.getenv("PASSWORD_DB")
-path_proxy="/root/bio_parse/proxy.txt"                                       #r"C:\Users\User\PycharmProjects\proxy\proxy.txt"  #"/root/bio_parse/proxy.txt
+path_proxy="proxy.txt"
 users_ids =[]
 async def load_users_ids():
     global users_ids
@@ -86,7 +86,7 @@ async def fetch_all(usernames, proxy):
 
 async def process_users():
     proxy = []
-    with open(path_proxy, 'r') as f: #r"C:\Users\User\PycharmProjects\proxy\proxy.txt"  #"/root/bio_parse/proxy.txt
+    with open(path_proxy, 'r') as f:
         for line in f:
             host, port, user, password = line.strip().split(':')
             proxy.append(f'http://{user}:{password}@{host}:{port}')
