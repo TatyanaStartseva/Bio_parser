@@ -117,19 +117,19 @@ async def process_users():
         users_ids = await load_users_ids()
         pool = db()
         cursor_users = pool["users"]
-        size = 15000
+        size = 15
         cursor = cursor_users.find({}).sort({"dateUpdated": 1}).limit(size)
         documents = await cursor.to_list(length=size)
         if documents:
             min_date = (
                 documents[0]["dateUpdated"].replace(microsecond=0)
                 if "dateUpdated" in documents[0]
-                else datetime.now()
+                else datetime.now().replace(microsecond=0)
             )
             max_date = (
                 documents[-1]["dateUpdated"].replace(microsecond=0)
                 if "dateUpdated" in documents[-1]
-                else datetime.now()
+                else datetime.now().replace(microsecond=0)
             )
         for user_id in users_ids:
             await bot.send_message(
