@@ -6,14 +6,14 @@ import sys
 import asyncio
 import random
 import aiohttp
-import re
+import lxml.html
 import openpyxl
 from dotenv import load_dotenv
 from functools import wraps
 from aiohttp import ClientTimeout, ClientProxyConnectionError
 from aiogram import Bot
 from db.db import db
-from pymongo import ASCENDING
+import aiofiles
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +56,7 @@ def retry(retries):
 
 
 @retry(retries=3)
-async def fetch(task_id, username, proxy):
+async def fetch(task_id, username, empty_html, proxy):
     rand_proxy = random.choice(proxy)
     try:
         print(f"{task_id}: {username}")
@@ -65,22 +65,23 @@ async def fetch(task_id, username, proxy):
             async with session.get(url, proxy=rand_proxy) as response:
                 if response.status == 200:
                     html_content = await response.text(encoding="utf-8")
-                    match = re.search(
-                        r'<meta property="og:description" content="([^"]*)"',
-                        html_content,
-                        re.IGNORECASE,
-                    )
-                    match_name = re.search(
-                        r'<meta property="og:title" content="([^"]*)"', html_content
-                    )
-                    name = match_name.group(1) if match_name else None
-                    if match and bool(match.group(1)):
-                        bio = match.group(1)
+                    if not html_content.strip():
+                        empty_html["count"] += 1
+                        raise ValueError("HTML пуст")
+                    tree = lxml.html.fromstring(html_content)
+                    bio = tree.xpath('//meta[@property="og:description"]/@content')
+                    name = tree.xpath('//meta[@property="og:title"]/@content')
+                    match_ban = tree.xpath("//meta[@name='robots']/@content")
+                    name = name[0] if name else None
+                    if bio and len(bio[0]) != 0:
+                        bio = bio[0]
                         if bio.startswith("You can contact"):
                             return {"name": name, "bio": None}
                         return {"name": name, "bio": bio}
+                    elif match_ban:
+                        return {"name": name, "bio": "ban"}
                     else:
-                        raise ValueError("Bio not found")
+                        return {"name": name, "bio": None}
                 else:
                     raise aiohttp.ClientResponseError(
                         status=response.status,
@@ -93,14 +94,15 @@ async def fetch(task_id, username, proxy):
         raise
     except Exception as e:
         logging.error(
-            f"Ошибка в fetch {e} \n Использовался прокси: {rand_proxy} \n Обрабатывался пользователь: {username}"
+            f"Ошибка в fetch {e} \n Использовался прокси: {rand_proxy} \n "
+            f"Обрабатывался пользователь: {username} "
         )
         raise
 
 
-async def fetch_all(usernames, proxy):
+async def fetch_all(usernames, empty_html, proxy):
     tasks = [
-        asyncio.create_task(fetch(i, username["username"], proxy))
+        asyncio.create_task(fetch(i, username["username"], empty_html, proxy))
         for i, username in enumerate(usernames)
     ]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -117,7 +119,7 @@ async def process_users():
         users_ids = await load_users_ids()
         pool = db()
         cursor_users = pool["users"]
-        size = 15
+        size = 15000
         cursor = cursor_users.find({}).sort({"dateUpdated": 1}).limit(size)
         documents = await cursor.to_list(length=size)
         if documents:
@@ -145,10 +147,12 @@ async def process_users():
             for record in documents
         ]
         futures = []
-        future = asyncio.create_task(fetch_all(usernames, proxy))
+        empty_html = {"count": 0}
+        future = asyncio.create_task(fetch_all(usernames, empty_html, proxy))
         futures.append(future)
         access_request = 0
         fail_request = 0
+        ban_count = 0
         responses = await asyncio.gather(*futures, return_exceptions=True)
         flattened_responses = [
             response for responses in responses for response in responses
@@ -162,10 +166,18 @@ async def process_users():
             username = username_dict["username"]
             bio = username_dict["bio"]
             user_id = username_dict["user_id"]
-            if (
-                not isinstance(response, Exception)
-                and response["bio"] != "Bio not found"
-            ):
+            if isinstance(response, Exception):
+                await cursor_users.update_many(
+                    {"user_id": {"$in": [user_id for user_id, in ban_values]}},
+                    {
+                        "$set": {
+                            "ban": True,
+                            "dateUpdated": datetime.now(),
+                        }
+                    },
+                )
+                continue
+            if response["bio"] != "ban":
                 first_name = last_name = None
                 if response["name"]:
                     name_parts = response["name"].split()
@@ -283,10 +295,12 @@ async def process_users():
                         ]
                     )
                 access_request += 1
-            else:
+            elif response["bio"] == "ban":
                 ban_values.append((user_id,))
-                fail_request += 1
+                ban_count += 1
                 ws.append([f"{username}", "None", f"{bio}", "True", "True"])
+            else:
+                fail_request += 1
         if ban_values:
             await cursor_users.update_many(
                 {"user_id": {"$in": [user_id for user_id, in ban_values]}},
@@ -298,9 +312,10 @@ async def process_users():
                 },
             )
         await asyncio.gather(*updates)
+
         wb.save("info_parse_bio.xlsx")
-        with open("info_parse_bio.xlsx", "rb") as f:
-            file_content = f.read()
+        async with aiofiles.open("info_parse_bio.xlsx", "rb") as f:
+            file_content = await f.read()
             for user_id in users_ids:
                 byte_file_content = io.BytesIO(file_content)
                 byte_file_content.name = "info_parse_bio.xlsx"
@@ -309,7 +324,9 @@ async def process_users():
                     user_id,
                     f"Обработано {size} пользователей. \n С {min_date} по "
                     f"{max_date} \n Успешные запросы: {access_request}, "
-                    f"\n Заблокированные пользователи: {fail_request} ",
+                    f"\n Заблокированные пользователи: {ban_count} \n "
+                    f"Не успешные запросы: {fail_request} \n "
+                    f"Кол-во пустых HTML : {empty_html['count']}",
                 )
                 await bot.send_document(user_id, byte_file_content)
     except Exception as e:
@@ -317,6 +334,27 @@ async def process_users():
         users_ids = await load_users_ids()
         for user_id in users_ids:
             await bot.send_message(user_id, f"Ошибка в process_users: {e} ")
+
+
+
+def uhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    loop = asyncio.new_event_loop()
+
+    async def handle_exception():
+        users_ids = await load_users_ids()
+        for user_id in users_ids:
+            await bot.send_message(
+                user_id, f"Непойманное исключение {exc_value} {exc_traceback}"
+            )
+        logging.error(f"Непойманное исключение {exc_value} {exc_traceback}")
+
+    loop.run_until_complete(handle_exception())
+
+
+sys.excepthook = uhandled_exception
 
 
 def uhandled_exception(exc_type, exc_value, exc_traceback):
